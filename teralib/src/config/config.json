@@ -1,6 +1,6 @@
 {
-    "LOGIN_ACTION_URL": "http://SERVERIP-URI/tera/LauncherLoginAction",
-    "HASH_FILE_URL": "http://SERVERIP-URI/tera/launcher/hash-file.json",
-    "FILE_SERVER_URL": "http://SERVERIP-URI/public",
-    "SERVER_LIST_URL": "http://SERVERIP-URI/tera/ServerList.json?lang=en&sort=3"
+    "LOGIN_ACTION_URL": "http://tera-dimension.duckdns.org:8090/launcher/LoginAction",
+    "HASH_FILE_URL": "http://tera-dimension.duckdns.org:8090/tera/launcher/hash-file.json",
+    "FILE_SERVER_URL": "http://tera-dimension.duckdns.org:8090/public",
+    "SERVER_LIST_URL": "http://tera-dimension.duckdns.org:8090/tera/ServerList.json?lang=en&sort=3"
   }

@@ -934,26 +934,82 @@ fn set_auth_info(auth_key: String, user_name: String, user_no: i32, character_co
 
 #[tauri::command]
 async fn login(username: String, password: String) -> Result<String, String> {
-    let client = Client::new();
-    let url = get_config_value("LOGIN_ACTION_URL");
-
-    let payload = format!("login={}&password={}", username, password);
-
-    let res = client
-        .post(url)
-        .body(payload)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .send().await
+    // Client with cookie_store so the session cookie is preserved across requests
+    let client = Client::builder()
+        .cookie_store(true)
+        .build()
         .map_err(|e| e.to_string())?;
 
-    let body = res.text().await.map_err(|e| e.to_string())?;
+    let login_url = get_config_value("LOGIN_ACTION_URL");
 
-    println!("Response body: {}", body);
+    // Derive base launcher URL (e.g. http://host:port/launcher/LoginAction -> http://host:port/launcher)
+    let base_url = login_url.trim_end_matches("/LoginAction").to_string();
+    let account_info_url = format!("{}/GetAccountInfoAction", base_url);
+    let char_count_url   = format!("{}/GetCharacterCountAction", base_url);
+    let auth_key_url     = format!("{}/GetAuthKeyAction", base_url);
 
-    match serde_json::from_str::<Value>(&body) {
-        Ok(json) => Ok(json.to_string()),
-        Err(_) => Ok(body),
+    // Step 1: POST login credentials as URL-encoded form data
+    let login_res = client
+        .post(&login_url)
+        .form(&[("login", username.as_str()), ("password", password.as_str())])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let login_body: Value = login_res.json().await.map_err(|e| e.to_string())?;
+    println!("Login response: {}", login_body);
+
+    if login_body["Return"].as_bool() != Some(true) {
+        let msg = login_body["Msg"].as_str().unwrap_or("Invalid login or password").to_string();
+        return Ok(json!({ "Return": false, "ReturnCode": 12, "Msg": msg }).to_string());
     }
+
+    // Step 2: GET account info (session cookie auto-managed by client)
+    let account_res = client
+        .get(&account_info_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let account_body: Value = account_res.json().await.map_err(|e| e.to_string())?;
+    println!("Account info: {}", account_body);
+
+    // Step 3: GET character count
+    let char_count_res = client
+        .get(&char_count_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let char_count_body: Value = char_count_res.json().await.map_err(|e| e.to_string())?;
+    println!("Character count: {}", char_count_body);
+
+    // Step 4: GET auth key
+    let auth_key_res = client
+        .get(&auth_key_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let auth_key_body: Value = auth_key_res.json().await.map_err(|e| e.to_string())?;
+    println!("Auth key: {}", auth_key_body);
+
+    // Combine into the unified response the frontend expects
+    let char_count_str = char_count_body["CharacterCount"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "0|0".to_string());
+
+    let combined = json!({
+        "Return": true,
+        "ReturnCode": 0,
+        "Msg": "success",
+        "AuthKey": auth_key_body["AuthKey"].as_str().unwrap_or(""),
+        "UserName": account_body["UserName"].as_str().unwrap_or(""),
+        "UserNo": account_body["UserNo"].as_i64().unwrap_or(0),
+        "CharacterCount": char_count_str,
+        "Permission": account_body["Permission"].as_i64().unwrap_or(0),
+        "Privilege": account_body["Privilege"].as_i64().unwrap_or(0),
+    });
+
+    Ok(combined.to_string())
 }
 
 #[tauri::command]
