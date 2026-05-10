@@ -1013,6 +1013,42 @@ async fn login(username: String, password: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn register(username: String, email: String, password: String) -> Result<String, String> {
+    let client = Client::builder()
+        .cookie_store(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let login_url = get_config_value("LOGIN_ACTION_URL");
+    let base_url = login_url.trim_end_matches("/LoginAction").to_string();
+    let signup_form_url = format!("{}/SignupForm", base_url);
+    let signup_action_url = format!("{}/SignupAction", base_url);
+
+    // Step 1: GET SignupForm to initialize session (sets captchaVerified = true server-side)
+    client
+        .get(&signup_form_url)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Step 2: POST SignupAction with form fields
+    let res = client
+        .post(&signup_action_url)
+        .form(&[
+            ("login", username.as_str()),
+            ("email", email.as_str()),
+            ("password", password.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let body: Value = res.json().await.map_err(|e| e.to_string())?;
+    println!("Register response: {}", body);
+    Ok(body.to_string())
+}
+
+#[tauri::command]
 async fn handle_logout(state: tauri::State<'_, GameState>) -> Result<(), String> {
     let mut is_launching = state.is_launching.lock().await;
     *is_launching = false;
@@ -1108,6 +1144,7 @@ fn main() {
                 reset_launch_state,
                 login,
                 set_auth_info,
+                register,
                 get_language_from_config,
                 save_language_to_config,
                 get_files_to_update,

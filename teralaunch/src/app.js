@@ -1141,6 +1141,109 @@ const App = {
   },
 
   /**
+   * Handles account registration via the launcher.
+   *
+   * Validates the form client-side, then calls the Rust `register` command
+   * which GETs /SignupForm (to set captchaVerified) then POSTs /SignupAction.
+   *
+   * @param {string} username - The desired username (alphanumeric, 3-24 chars)
+   * @param {string} email - The account email address
+   * @param {string} password - The account password (min 8 chars)
+   * @param {string} confirmPassword - Password confirmation (client-side check)
+   *
+   * @returns {Promise<void>}
+   */
+  async handleRegister(username, email, password, confirmPassword) {
+    const registerButton = document.getElementById("register-button");
+    const errorMsg = document.getElementById("register-error-msg");
+    const successMsg = document.getElementById("register-success-msg");
+
+    const showError = (msg) => {
+      if (errorMsg) {
+        errorMsg.textContent = msg;
+        errorMsg.style.display = "flex";
+        errorMsg.style.opacity = 1;
+      }
+      if (successMsg) { successMsg.style.display = "none"; successMsg.style.opacity = 0; }
+    };
+
+    const hideMessages = () => {
+      if (errorMsg) { errorMsg.style.display = "none"; errorMsg.style.opacity = 0; }
+      if (successMsg) { successMsg.style.display = "none"; successMsg.style.opacity = 0; }
+    };
+
+    hideMessages();
+
+    // Client-side validation
+    if (!username || username.length < 3 || username.length > 24 || !/^[a-zA-Z0-9]+$/.test(username)) {
+      showError(this.t("REGISTER_ERROR_USERNAME") || "Username must be 3-24 alphanumeric characters.");
+      return;
+    }
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      showError(this.t("REGISTER_ERROR_EMAIL") || "Please enter a valid email address.");
+      return;
+    }
+    if (!password || password.length < 8) {
+      showError(this.t("REGISTER_ERROR_PASSWORD") || "Password must be at least 8 characters.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      showError(this.t("REGISTER_ERROR_CONFIRM") || "Passwords do not match.");
+      return;
+    }
+
+    if (registerButton) {
+      registerButton.disabled = true;
+      registerButton.textContent = this.t("REGISTER_IN_PROGRESS") || "Registering...";
+    }
+
+    try {
+      const response = await invoke("register", { username, email, password });
+      const jsonResponse = JSON.parse(response);
+
+      if (jsonResponse && jsonResponse.Return === true) {
+        // Success — show message and switch to login after 3 seconds
+        if (successMsg) {
+          successMsg.textContent = this.t("REGISTER_SUCCESS") || "Account created! You can now sign in.";
+          successMsg.style.display = "flex";
+          successMsg.style.opacity = 1;
+        }
+        if (errorMsg) { errorMsg.style.display = "none"; errorMsg.style.opacity = 0; }
+
+        setTimeout(() => {
+          document.getElementById("register-form-panel").style.display = "none";
+          document.getElementById("login-form-panel").style.display = "";
+          // Pre-fill the username for convenience
+          const usernameInput = document.getElementById("username");
+          if (usernameInput) usernameInput.value = username;
+        }, 2500);
+      } else {
+        // Map server error codes to messages
+        const errorCode = jsonResponse ? jsonResponse.ReturnCode : null;
+        const errorMap = {
+          10: this.t("REGISTER_ERROR_USERNAME_TAKEN") || "Username is already taken.",
+          11: this.t("REGISTER_ERROR_USERNAME") || "Username must be 3-24 alphanumeric characters.",
+          12: this.t("REGISTER_ERROR_EMAIL") || "Invalid email address.",
+          13: this.t("REGISTER_ERROR_PASSWORD") || "Password must be at least 8 characters.",
+          14: this.t("REGISTER_ERROR_EMAIL_TAKEN") || "Email is already in use.",
+          15: this.t("REGISTER_ERROR_CAPTCHA") || "Session error. Please try again.",
+          100: this.t("REGISTER_DISABLED") || "Registration is currently disabled.",
+        };
+        const msg = errorMap[errorCode] || (jsonResponse && jsonResponse.Msg) || this.t("SERVER_CONNECTION_ERROR");
+        showError(msg);
+      }
+    } catch (error) {
+      console.error("Error during registration:", error);
+      showError(error.message || this.t("SERVER_CONNECTION_ERROR"));
+    } finally {
+      if (registerButton) {
+        registerButton.disabled = false;
+        registerButton.textContent = this.t("REGISTER_BUTTON") || "REGISTER";
+      }
+    }
+  },
+
+  /**
    * Stores the authentication info in local storage and
    * informs the backend to set the authentication info
    * @param {Object} jsonResponse - The JSON response from the server
@@ -2042,6 +2145,48 @@ const App = {
         const username = document.getElementById("username").value;
         const password = document.getElementById("password").value;
         await this.login(username, password);
+      });
+    }
+
+    // Toggle to register form
+    const showRegisterBtn = document.getElementById("show-register-btn");
+    if (showRegisterBtn) {
+      showRegisterBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        document.getElementById("login-form-panel").style.display = "none";
+        const regPanel = document.getElementById("register-form-panel");
+        regPanel.style.display = "";
+        // Clear register fields and messages
+        document.getElementById("reg-username").value = "";
+        document.getElementById("reg-email").value = "";
+        document.getElementById("reg-password").value = "";
+        document.getElementById("reg-confirm-password").value = "";
+        const errMsg = document.getElementById("register-error-msg");
+        const succMsg = document.getElementById("register-success-msg");
+        if (errMsg) { errMsg.style.display = "none"; errMsg.style.opacity = 0; }
+        if (succMsg) { succMsg.style.display = "none"; succMsg.style.opacity = 0; }
+      });
+    }
+
+    // Toggle back to login form
+    const showLoginBtn = document.getElementById("show-login-btn");
+    if (showLoginBtn) {
+      showLoginBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        document.getElementById("register-form-panel").style.display = "none";
+        document.getElementById("login-form-panel").style.display = "";
+      });
+    }
+
+    // Register button handler
+    const registerButton = document.getElementById("register-button");
+    if (registerButton) {
+      registerButton.addEventListener("click", async () => {
+        const username = document.getElementById("reg-username").value.trim();
+        const email = document.getElementById("reg-email").value.trim();
+        const password = document.getElementById("reg-password").value;
+        const confirmPassword = document.getElementById("reg-confirm-password").value;
+        await this.handleRegister(username, email, password, confirmPassword);
       });
     }
   },
