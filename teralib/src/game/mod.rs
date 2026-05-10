@@ -807,17 +807,10 @@ fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error
 
     let parts: Vec<&str> = credentials.split('|').collect();
 
-    let player_last_server = parts.first().unwrap_or(&"0");
-    let player_last_server_id = if parts.len() > 1 && !parts[1].is_empty() {
-        parts[1]
-            .split(',')
-            .next()
-            .unwrap_or("0")
-            .parse::<u32>()
-            .unwrap_or(0)
-    } else {
-        2800
-    };
+    let player_last_server_id = parts
+        .first()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
 
     // Parse character counts for each server
     let character_counts: std::collections::HashMap<u32, u32> = if parts.len() > 1 {
@@ -838,8 +831,8 @@ fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error
     };
 
     info!(
-        "Parsed values - Last server: {}, Last server ID: {}, Character counts: {:?}",
-        player_last_server, player_last_server_id, character_counts
+        "Parsed values - Last server ID: {}, Character counts: {:?}",
+        player_last_server_id, character_counts
     );
 
     let servers = json["servers"]
