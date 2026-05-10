@@ -1021,19 +1021,16 @@ async fn register(username: String, email: String, password: String) -> Result<S
 
     let login_url = get_config_value("LOGIN_ACTION_URL");
     let base_url = login_url.trim_end_matches("/LoginAction").to_string();
-    let signup_form_url = format!("{}/SignupForm", base_url);
     let signup_action_url = format!("{}/SignupAction", base_url);
 
-    // Step 1: GET SignupForm to initialize session (sets captchaVerified = true server-side)
-    client
-        .get(&signup_form_url)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    // Read the launcher bypass token from config (avoids needing to GET /SignupForm
+    // when captcha is enabled, since captchaVerified would be set to false anyway)
+    let register_token = get_config_value("LAUNCHER_REGISTER_TOKEN");
 
-    // Step 2: POST SignupAction with form fields
+    // POST SignupAction with form fields and launcher bypass token header
     let res = client
         .post(&signup_action_url)
+        .header("x-launcher-register-token", &register_token)
         .form(&[
             ("login", username.as_str()),
             ("email", email.as_str()),
