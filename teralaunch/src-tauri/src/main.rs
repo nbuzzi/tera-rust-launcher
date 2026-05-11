@@ -33,6 +33,7 @@ use walkdir::WalkDir;
 
 mod optimizer;
 mod language;
+mod self_update;
 
 // Struct definitions
 #[derive(Serialize, Deserialize)]
@@ -1509,6 +1510,8 @@ fn main() {
                 lang_switch_to_english,
                 kill_stale_tera_processes,
                 diagnose_launch,
+                self_update::check_launcher_update,
+                self_update::apply_launcher_update,
             ]
         )
         .run(tauri::generate_context!())

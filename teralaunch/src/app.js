@@ -107,6 +107,12 @@ const App = {
    */
   async init() {
     try {
+      // Self-update check (non-blocking on failure). Runs first so a fresh
+      // binary can launch before we wire up the rest of the UI.
+      this.checkLauncherUpdate().catch((e) =>
+        console.warn("Launcher self-update check failed:", e),
+      );
+
       this.disableContextMenu();
       this.setupEventListeners();
       this.setupWindowControls();
@@ -2713,6 +2719,76 @@ const App = {
       console.error("Error saving game path:", error);
       this.showCustomNotification(this.t("GAME_PATH_SAVE_ERROR"), "error");
       throw error;
+    }
+  },
+
+  /**
+   * Checks the update server for a newer launcher build and, if one exists,
+   * shows a confirmation dialog. On accept, downloads the new exe and exits
+   * so the helper script can replace the running binary and relaunch.
+   *
+   * Failures are swallowed (server offline, manifest missing, etc.) so a
+   * broken update channel never prevents the launcher from starting.
+   */
+  async checkLauncherUpdate() {
+    let result;
+    try {
+      result = await invoke("check_launcher_update");
+    } catch (err) {
+      console.warn("check_launcher_update failed:", err);
+      return;
+    }
+    if (!result || !result.update_available) {
+      console.log(
+        `Launcher up to date (current=${result?.current_version}, latest=${result?.latest_version})`,
+      );
+      return;
+    }
+
+    const lines = [
+      `Hay una nueva versi\u00f3n del launcher disponible.`,
+      ``,
+      `Versi\u00f3n actual: ${result.current_version}`,
+      `Versi\u00f3n nueva : ${result.latest_version}`,
+      ``,
+      result.notes ? `Cambios:\n${result.notes}` : ``,
+      ``,
+      result.mandatory
+        ? `Esta actualizaci\u00f3n es OBLIGATORIA para poder jugar.`
+        : `\u00bfQuer\u00e9s actualizar ahora? El launcher se cerrar\u00e1 y volver\u00e1 a abrirse autom\u00e1ticamente.`,
+    ].join("\n");
+
+    let accept = result.mandatory;
+    if (!result.mandatory) {
+      try {
+        accept = window.confirm(lines);
+      } catch (_) {
+        accept = false;
+      }
+    } else {
+      try {
+        window.alert(lines);
+      } catch (_) {}
+    }
+    if (!accept) {
+      console.log("User declined launcher update.");
+      return;
+    }
+
+    try {
+      await invoke("apply_launcher_update", {
+        url: result.url,
+        sha256: null,
+      });
+      // The Rust side will exit the process after spawning the helper.
+    } catch (err) {
+      console.error("apply_launcher_update failed:", err);
+      try {
+        await message(
+          `No se pudo aplicar la actualizaci\u00f3n:\n${err}`,
+          { title: "Update", type: "error" },
+        );
+      } catch (_) {}
     }
   },
 
