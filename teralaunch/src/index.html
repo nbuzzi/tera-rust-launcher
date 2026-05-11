@@ -116,7 +116,6 @@
     <div id="perfStatus" class="perf-status">
       <div><b>INI patched:</b> <span id="st-ini">?</span></div>
       <div><b>INI aggressive:</b> <span id="st-ini-agg">?</span></div>
-      <div><b>LAA patched:</b> <span id="st-laa">?</span></div>
       <div><b>DXVK installed:</b> <span id="st-dxvk">?</span></div>
       <div><b>LFH enabled:</b> <span id="st-lfh">?</span></div>
       <div><b>Game Bar off:</b> <span id="st-gbar">?</span></div>
@@ -129,7 +128,7 @@
         <b>SAFE</b><br><span>Only INI tweaks</span>
       </button>
       <button class="perf-btn" data-profile="balanced">
-        <b>BALANCED</b><br><span>INI + LAA + LFH<br><i>admin</i></span>
+        <b>BALANCED</b><br><span>INI + LFH<br><i>admin</i></span>
       </button>
       <button class="perf-btn perf-btn-max" data-profile="maximum">
         <b>MAXIMUM</b><br><span>+ DXVK (DX9→Vulkan)<br><i>admin</i></span>
@@ -144,7 +143,6 @@
       <div class="perf-toggle-row">
         <button class="perf-btn-sec" data-cmd="opt_patch_ini">Apply base INI</button>
         <button class="perf-btn-sec" data-cmd="opt_patch_ini_aggressive">Apply aggressive INI</button>
-        <button class="perf-btn-sec" data-cmd="opt_patch_laa">Patch LAA (.exe)</button>
         <button class="perf-btn-sec" data-cmd="opt_enable_lfh">Enable LFH</button>
         <button class="perf-btn-sec" data-cmd="opt_install_dxvk">Install DXVK</button>
         <button class="perf-btn-sec" data-cmd="opt_disable_game_bar">Disable Game Bar</button>
@@ -248,7 +246,6 @@
         const st = await invoke('opt_get_status');
         setBool('st-ini',     st.ini_patched);
         setBool('st-ini-agg', st.ini_aggressive);
-        setBool('st-laa',     st.laa_patched);
         setBool('st-dxvk',    st.dxvk_installed);
         setBool('st-lfh',     st.lfh_enabled);
         setBool('st-gbar',    st.game_bar_disabled);

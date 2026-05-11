@@ -613,12 +613,21 @@ pub fn apply_profile(
         Err(e) => steps.push(StepResult { name: "INI patches".into(), ok: false, detail: e }),
     }
 
-    // LAA + LFH (Balanced, Maximum, Ultra)
+    // LFH (Balanced, Maximum, Ultra)
+    // NOTE: LAA exe patch removed — it breaks TERA (anti-cheat / integrity check).
+    // If a previous version of the launcher already patched it, revert_all will undo it.
     if matches!(profile, Profile::Balanced | Profile::Maximum | Profile::Ultra) {
+        // Auto-revert any pre-existing LAA patch so the game runs.
         let exe = game_path.join("Binaries").join("TERA.exe");
-        match patch_exe_laa(&exe) {
-            Ok(s) => steps.push(s),
-            Err(e) => steps.push(StepResult { name: "LAA patch".into(), ok: false, detail: e }),
+        if check_exe_laa(&exe).unwrap_or(false) {
+            match revert_exe_laa(&exe) {
+                Ok(s) => steps.push(StepResult {
+                    name: "LAA auto-revert".into(), ok: s.ok, detail: s.detail,
+                }),
+                Err(e) => steps.push(StepResult {
+                    name: "LAA auto-revert".into(), ok: false, detail: e,
+                }),
+            }
         }
         match enable_lfh() {
             Ok(s) => steps.push(s),
