@@ -469,6 +469,45 @@ unsafe fn create_and_run_game_window(tcs: Arc<Notify>) {
 
     info!("Window created with HWND: {:?}", hwnd);
 
+    // Allow WM_COPYDATA to be received from processes running at a different
+    // (typically lower) integrity level. Without this, Windows UIPI silently
+    // drops the messages the game sends to the launcher window when the
+    // launcher is elevated and Tera.exe is not (or vice versa), and the
+    // client gets stuck on the "Fate of Arun" splash waiting for the account
+    // name / ticket / server list responses.
+    {
+        type ChangeWindowMessageFilterExFn = unsafe extern "system" fn(
+            HWND,
+            UINT,
+            u32,
+            *mut winapi::um::winuser::CHANGEFILTERSTRUCT,
+        ) -> BOOL;
+        const MSGFLT_ALLOW: u32 = 1;
+        let user32 = winapi::um::libloaderapi::LoadLibraryA(
+            b"user32.dll\0".as_ptr() as *const i8,
+        );
+        if !user32.is_null() {
+            let proc_addr = winapi::um::libloaderapi::GetProcAddress(
+                user32,
+                b"ChangeWindowMessageFilterEx\0".as_ptr() as *const i8,
+            );
+            if !proc_addr.is_null() {
+                let func: ChangeWindowMessageFilterExFn = std::mem::transmute(proc_addr);
+                if func(hwnd, WM_COPYDATA, MSGFLT_ALLOW, null_mut()) == 0 {
+                    let err = GetLastError();
+                    error!(
+                        "ChangeWindowMessageFilterEx(WM_COPYDATA) failed, error code: {}",
+                        err
+                    );
+                } else {
+                    info!("UIPI filter set: WM_COPYDATA allowed for launcher window");
+                }
+            } else {
+                info!("ChangeWindowMessageFilterEx not available on this Windows version");
+            }
+        }
+    }
+
     if let Ok(mut handle) = WINDOW_HANDLE.lock() {
         handle.replace(SafeHWND::new(hwnd));
     } else {
@@ -805,6 +844,8 @@ fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error
     let credentials = GLOBAL_CREDENTIALS.get_characters_count();
     info!("Raw credentials string: {}", credentials);
 
+    // Format from Portal API: "lastLoginServer|serverId,charCount|serverId,charCount|"
+    // Each '|'-separated entry after the first is one "serverId,charCount" pair.
     let parts: Vec<&str> = credentials.split('|').collect();
 
     let player_last_server_id = parts
@@ -812,23 +853,20 @@ fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
 
-    // Parse character counts for each server
-    let character_counts: std::collections::HashMap<u32, u32> = if parts.len() > 1 {
-        parts[1]
-            .split(',')
-            .collect::<Vec<&str>>()
-            .chunks(2)
-            .filter_map(|chunk| {
-                if chunk.len() == 2 {
-                    Some((chunk[0].parse::<u32>().ok()?, chunk[1].parse::<u32>().ok()?))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
+    // Parse character counts for each server (one pair per '|'-separated entry)
+    let character_counts: std::collections::HashMap<u32, u32> = parts
+        .iter()
+        .skip(1)
+        .filter_map(|entry| {
+            if entry.is_empty() {
+                return None;
+            }
+            let mut it = entry.split(',');
+            let id = it.next()?.trim().parse::<u32>().ok()?;
+            let count = it.next()?.trim().parse::<u32>().ok()?;
+            Some((id, count))
+        })
+        .collect();
 
     info!(
         "Parsed values - Last server ID: {}, Character counts: {:?}",
@@ -879,17 +917,29 @@ fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error
                 .to_string()
         };
 
-        // Handle address and host fields
+        // Handle address and host fields.
+        // If 'address' is present but is not a valid IPv4 literal (e.g. a hostname),
+        // fall back to using it as 'host' so the client resolves it instead of
+        // connecting to 0.0.0.0.
         let address_str = server["address"].as_str();
         let host_str = server["host"].as_str();
 
-        let (address, host) = match (address_str, host_str) {
-            (Some(addr), Some(_)) => {
-                // If both are present, use address and ignore host
-                (ipv4_to_u32(addr), Vec::new())
+        let parse_addr_or_host = |addr: &str| -> (u32, Vec<u8>) {
+            match addr.parse::<std::net::Ipv4Addr>() {
+                Ok(ip) => (u32::from_be_bytes(ip.octets()), Vec::new()),
+                Err(_) => (0, utf16_to_bytes(addr)),
             }
-            (Some(addr), None) => (ipv4_to_u32(addr), Vec::new()),
-            (None, Some(h)) => (0, utf16_to_bytes(h)),
+        };
+
+        let (address, host) = match (address_str, host_str) {
+            (Some(addr), _) => parse_addr_or_host(addr),
+            (None, Some(h)) => {
+                // If host happens to be a literal IPv4, use the address field too.
+                match h.parse::<std::net::Ipv4Addr>() {
+                    Ok(ip) => (u32::from_be_bytes(ip.octets()), Vec::new()),
+                    Err(_) => (0, utf16_to_bytes(h)),
+                }
+            }
             (None, None) => return Err("Either 'address' or 'host' must be set".into()),
         };
 
@@ -912,7 +962,7 @@ fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error
             port: server["port"]
                 .as_u64()
                 .ok_or("Missing or invalid 'port' field")? as u32,
-            available: 1,
+            available: json_available as u32,
             unavailable_message: utf16_to_bytes(
                 server["unavailable_message"].as_str().unwrap_or(""),
             ),
@@ -953,6 +1003,7 @@ fn utf16_to_bytes(s: &str) -> Vec<u8> {
 /// # Returns
 ///
 /// A u32 representation of the IP address, or 0 if parsing fails.
+#[allow(dead_code)]
 fn ipv4_to_u32(ip: &str) -> u32 {
     ip.parse::<std::net::Ipv4Addr>()
         .map(|addr| u32::from_be_bytes(addr.octets()))
