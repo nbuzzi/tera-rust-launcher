@@ -38,6 +38,7 @@
         <div class="select-wrapper">
           <select id="language-selector">
             <option value="EUR">ENGLISH</option>
+            <option value="ESP">SPANISH</option>
             <option value="FRA">FRENCH</option>
             <option value="RUS">RUSSIAN</option>
             <option value="GER">GERMAN</option>
@@ -45,6 +46,7 @@
           <div class="select-styled">ENGLISH</div>
           <ul class="select-options">
             <li rel="EUR">ENGLISH</li>
+            <li rel="ESP">SPANISH</li>
             <li rel="FRA">FRENCH</li>
             <li rel="RUS">RUSSIAN</li>
             <li rel="GER">GERMAN</li>
@@ -150,11 +152,36 @@
       </div>
     </details>
 
+    <div class="lang-section" style="display:none">
+      <!-- Language is now selected from the header dropdown (Region). Section kept for legacy refs. -->
+      <div class="lang-header">
+        <b>Language / Idioma:</b>
+        <span id="lang-current">?</span>
+        <span id="lang-available" class="lang-available"></span>
+      </div>
+      <div class="lang-buttons">
+        <button class="lang-btn lang-btn-en" id="btn-lang-en">English</button>
+        <button class="lang-btn lang-btn-es" id="btn-lang-es">Español</button>
+      </div>
+    </div>
+
     <div class="perf-actions">
       <button class="perf-btn-sec" id="btn-refresh-status">Refresh status</button>
       <button class="perf-btn-sec" id="btn-elevate">Relaunch as Admin</button>
       <button class="perf-btn-danger" id="btn-revert">Revert all</button>
     </div>
+
+    <details class="perf-details">
+      <summary>Troubleshooting (game won't launch / crashes silently)</summary>
+      <div class="perf-toggle-row">
+        <button class="perf-btn-sec" id="btn-diagnose">Diagnose</button>
+        <button class="perf-btn-sec" id="btn-kill-zombies">Kill zombie TERA.exe</button>
+      </div>
+      <div style="font-size:11px;color:#888;margin-top:6px;">
+        If the game crashes silently after clicking PLAY: click "Kill zombie TERA.exe"
+        first, then try again. Check <code>Binaries/tera_launch.log</code> for crash output.
+      </div>
+    </details>
 
     <div id="perfLog" class="perf-log"></div>
   </div>
@@ -197,6 +224,18 @@
   .perf-details summary:hover { color: #fff; }
   .perf-toggle-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .perf-toggle-row .perf-btn-sec { flex: 1 1 auto; min-width: 120px; padding: 6px 8px; font-size: 11px; }
+  .lang-section { background: rgba(0,0,0,.25); padding: 8px 10px; border-radius: 4px; margin-bottom: 10px; }
+  .lang-header { font-size: 13px; color: #ddd; margin-bottom: 6px; display: flex; gap: 8px; align-items: center; }
+  .lang-header #lang-current { color: #6cf; font-weight: bold; }
+  .lang-available { font-size: 11px; color: #888; margin-left: auto; }
+  .lang-available.ready { color: #6f6; }
+  .lang-available.missing { color: #f88; }
+  .lang-buttons { display: flex; gap: 8px; }
+  .lang-btn { flex: 1; padding: 8px 10px; border: 0; border-radius: 4px; color: #fff; cursor: pointer; font-size: 13px; font-weight: bold; }
+  .lang-btn-en { background: linear-gradient(135deg, #1e4e8c, #3070b8); }
+  .lang-btn-es { background: linear-gradient(135deg, #aa1f1f, #d04040); }
+  .lang-btn:hover { filter: brightness(1.15); }
+  .lang-btn:disabled { opacity: .4; cursor: not-allowed; }
   .perf-actions  { display: flex; gap: 8px; margin-bottom: 10px; }
   .perf-btn-sec, .perf-btn-danger {
     flex: 1; padding: 8px; border: 1px solid #555; background: #1e1e1e;
@@ -329,6 +368,70 @@
       if (!confirm('The launcher will relaunch with admin rights (UAC prompt). Continue?')) return;
       try { await invoke('opt_relaunch_as_admin'); } catch (e) { logLine('elevate error: ' + e, 'step-err'); }
     });
+
+    // --- Language switching ---
+    async function refreshLang() {
+      const invoke = getInvoke();
+      if (!invoke) return;
+      try {
+        const st = await invoke('lang_get_status');
+        const cur = document.getElementById('lang-current');
+        const av  = document.getElementById('lang-available');
+        if (cur) cur.textContent = st.current;
+        if (av) {
+          if (st.spanish_available) {
+            av.textContent = '(Spanish file ready)';
+            av.className = 'lang-available ready';
+          } else {
+            av.textContent = '(Spanish file missing in resources/lang/)';
+            av.className = 'lang-available missing';
+          }
+        }
+        const btnEs = document.getElementById('btn-lang-es');
+        if (btnEs) btnEs.disabled = !st.spanish_available;
+      } catch (e) { logLine('lang status error: ' + e, 'step-err'); }
+    }
+    async function switchLang(target) {
+      const invoke = getInvoke();
+      if (!invoke) return;
+      const cmd = target === 'spanish' ? 'lang_switch_to_spanish' : 'lang_switch_to_english';
+      logLine('>>> ' + cmd);
+      try {
+        const r = await invoke(cmd);
+        logLine('  ' + (r.ok ? 'OK  ' : 'ERR ') + r.name + ': ' + r.detail,
+                r.ok ? 'step-ok' : 'step-err');
+      } catch (e) { logLine('  ERR ' + e, 'step-err'); }
+      await refreshLang();
+    }
+    const btnEn = document.getElementById('btn-lang-en');
+    const btnEs = document.getElementById('btn-lang-es');
+    if (btnEn) btnEn.addEventListener('click', () => switchLang('english'));
+    if (btnEs) btnEs.addEventListener('click', () => switchLang('spanish'));
+
+    // --- Troubleshooting ---
+    const diagBtn = document.getElementById('btn-diagnose');
+    if (diagBtn) diagBtn.addEventListener('click', async () => {
+      const invoke = getInvoke();
+      if (!invoke) return;
+      logLine('>>> Diagnose');
+      try {
+        const r = await invoke('diagnose_launch');
+        r.split('\n').forEach(line => logLine('  ' + line));
+      } catch (e) { logLine('  ERR ' + e, 'step-err'); }
+    });
+    const killBtn = document.getElementById('btn-kill-zombies');
+    if (killBtn) killBtn.addEventListener('click', async () => {
+      const invoke = getInvoke();
+      if (!invoke) return;
+      logLine('>>> Kill zombie TERA.exe');
+      try {
+        const r = await invoke('kill_stale_tera_processes');
+        logLine('  ' + r, 'step-ok');
+      } catch (e) { logLine('  ERR ' + e, 'step-err'); }
+    });
+
+    // refresh language whenever modal opens
+    if (openBtn) openBtn.addEventListener('click', () => { refreshLang(); });
   })();
 </script>
 </body>

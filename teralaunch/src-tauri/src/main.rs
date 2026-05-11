@@ -32,6 +32,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use walkdir::WalkDir;
 
 mod optimizer;
+mod language;
 
 // Struct definitions
 #[derive(Serialize, Deserialize)]
@@ -1130,6 +1131,139 @@ fn resolve_dxvk_resources(app: &tauri::AppHandle) -> Result<(PathBuf, PathBuf), 
     Ok((dll, conf))
 }
 
+/// Find the bundled Spanish DataCenter file. Returns None if not present.
+fn resolve_spanish_dat(app: &tauri::AppHandle) -> Option<PathBuf> {
+    let rel = "resources/lang/DataCenter_Final_EUR.dat";
+    if let Some(p) = app.path_resolver().resolve_resource(rel) {
+        if p.exists() { return Some(p); }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join(rel);
+            if p.exists() { return Some(p); }
+            if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
+                if let Some(src_tauri) = target_dir.parent() {
+                    let p2 = src_tauri.join(rel);
+                    if p2.exists() { return Some(p2); }
+                }
+            }
+        }
+    }
+    let cwd = PathBuf::from(rel);
+    if cwd.exists() { return Some(cwd); }
+    None
+}
+
+#[tauri::command]
+fn lang_get_status(app: tauri::AppHandle) -> Result<language::LanguageStatus, String> {
+    let (game_path, _) = load_config()?;
+    let spanish = resolve_spanish_dat(&app);
+    Ok(language::get_status(&game_path, spanish.as_deref()))
+}
+
+#[tauri::command]
+fn lang_switch_to_spanish(app: tauri::AppHandle) -> Result<language::StepResult, String> {
+    let (game_path, _) = load_config()?;
+    let spanish = resolve_spanish_dat(&app).ok_or_else(||
+        "Spanish DataCenter file not found. Place 'DataCenter_Final_EUR.dat' in 'resources/lang/' next to the launcher.".to_string()
+    )?;
+    language::switch_to_spanish(&game_path, &spanish)
+}
+
+#[tauri::command]
+fn lang_switch_to_english() -> Result<language::StepResult, String> {
+    let (game_path, _) = load_config()?;
+    language::switch_to_english(&game_path)
+}
+
+/// Kill any stale/zombie TERA.exe processes from a previous failed launch.
+/// Returns the number of processes killed.
+/// This is critical: a zombie TERA.exe holds the named launcher window and
+/// causes the next launch to silently fail.
+#[tauri::command]
+fn kill_stale_tera_processes() -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("taskkill")
+            .args(&["/F", "/IM", "TERA.exe", "/T"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // taskkill returns 128 if no process found - that's fine
+        if stderr.to_lowercase().contains("not found") || stderr.to_lowercase().contains("no se encontr") {
+            return Ok("No zombie TERA.exe found".into());
+        }
+        Ok(format!("Killed: {}", stdout.trim()))
+    }
+    #[cfg(not(windows))]
+    { Ok("Windows only".into()) }
+}
+
+/// Diagnose common launch problems. Returns a multi-line report.
+#[tauri::command]
+fn diagnose_launch() -> Result<String, String> {
+    let (game_path, lang) = load_config()?;
+    let exe = game_path.join("Binaries").join("TERA.exe");
+    let mut lines: Vec<String> = Vec::new();
+
+    lines.push(format!("Game path: {}", game_path.display()));
+    lines.push(format!("Configured language: {}", lang));
+    lines.push(format!("TERA.exe exists: {}", exe.exists()));
+    if exe.exists() {
+        if let Ok(meta) = std::fs::metadata(&exe) {
+            lines.push(format!("  size: {} bytes", meta.len()));
+        }
+        // LAA bit check (warn if patched - it breaks TERA)
+        match optimizer::check_exe_laa(&exe) {
+            Ok(true)  => lines.push("  ⚠ LAA bit is SET (will break TERA — click any profile to auto-revert)".into()),
+            Ok(false) => lines.push("  LAA bit: OK (unset)".into()),
+            Err(e)    => lines.push(format!("  LAA check failed: {}", e)),
+        }
+    }
+
+    // DataCenter check
+    let dat = game_path.join("S1Game").join("S1Data").join("DataCenter_Final_EUR.dat");
+    lines.push(format!("DataCenter_Final_EUR.dat exists: {} ({} bytes)",
+        dat.exists(),
+        std::fs::metadata(&dat).map(|m| m.len()).unwrap_or(0)));
+
+    // DXVK presence
+    let d3d9 = game_path.join("Binaries").join("d3d9.dll");
+    lines.push(format!("DXVK d3d9.dll present: {} ({} bytes)",
+        d3d9.exists(),
+        std::fs::metadata(&d3d9).map(|m| m.len()).unwrap_or(0)));
+
+    // Zombie TERA processes
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(&["/FI", "IMAGENAME eq TERA.exe", "/NH"])
+            .output();
+        if let Ok(o) = out {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let count = s.lines().filter(|l| l.to_lowercase().contains("tera.exe")).count();
+            lines.push(format!("Running TERA.exe processes: {}", count));
+            if count > 0 { lines.push("  ⚠ Kill zombies before launching!".into()); }
+        }
+
+        // Admin elevation
+        lines.push(format!("Launcher elevated: {}", opt_is_elevated()));
+    }
+
+    // Last crash log
+    let log = game_path.join("Binaries").join("tera_launch.log");
+    if log.exists() {
+        if let Ok(meta) = std::fs::metadata(&log) {
+            lines.push(format!("Last launch log: {} ({} bytes) — check for crash details", log.display(), meta.len()));
+        }
+    } else {
+        lines.push("No tera_launch.log yet (game hasn't launched since last update)".into());
+    }
+
+    Ok(lines.join("\n"))
+}
+
 #[tauri::command]
 fn opt_apply_profile(
     app: tauri::AppHandle,
@@ -1370,6 +1504,11 @@ fn main() {
                 opt_boost_running_game,
                 opt_is_elevated,
                 opt_relaunch_as_admin,
+                lang_get_status,
+                lang_switch_to_spanish,
+                lang_switch_to_english,
+                kill_stale_tera_processes,
+                diagnose_launch,
             ]
         )
         .run(tauri::generate_context!())

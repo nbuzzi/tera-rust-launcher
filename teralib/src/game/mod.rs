@@ -253,12 +253,57 @@ async fn launch_game() -> Result<ExitStatus, Box<dyn std::error::Error>> {
 
     tcs.notified().await;
 
-    let mut child = Command::new(GLOBAL_CREDENTIALS.get_game_path())
-        .arg(format!(
-            "-LANGUAGEEXT={}",
-            GLOBAL_CREDENTIALS.get_game_lang()
-        ))
-        .spawn()?;
+    // --- Robust spawn ---
+    // 1. Set CWD to the Binaries folder so TERA finds its DLLs (PhysX, GFx, dxvk, etc.)
+    //    This is CRITICAL: without it, users who launch from a shortcut without a
+    //    "Start in" path get a silent crash (DLL load failure).
+    // 2. Capture stdout/stderr to a file so we can diagnose crashes after the fact.
+    let game_path_str = GLOBAL_CREDENTIALS.get_game_path();
+    let game_path = std::path::Path::new(&game_path_str);
+    let work_dir = game_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Log file lives next to TERA.exe so it's easy to find.
+    let log_path = work_dir.join("tera_launch.log");
+    info!(
+        "Spawning game: exe={:?} cwd={:?} log={:?} lang={}",
+        game_path,
+        work_dir,
+        log_path,
+        GLOBAL_CREDENTIALS.get_game_lang()
+    );
+
+    let log_stdout = std::fs::File::create(&log_path).ok();
+    let log_stderr = log_stdout.as_ref().and_then(|f| f.try_clone().ok());
+
+    let mut cmd = Command::new(GLOBAL_CREDENTIALS.get_game_path());
+    cmd.arg(format!(
+        "-LANGUAGEEXT={}",
+        GLOBAL_CREDENTIALS.get_game_lang()
+    ))
+    .current_dir(&work_dir);
+
+    if let (Some(out), Some(err)) = (log_stdout, log_stderr) {
+        cmd.stdout(out).stderr(err);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(
+                "Failed to spawn TERA.exe at {:?} (cwd={:?}): {} (os_error={:?})",
+                game_path,
+                work_dir,
+                e,
+                e.raw_os_error()
+            );
+            GAME_RUNNING.store(false, Ordering::SeqCst);
+            GAME_STATUS_SENDER.send(false).unwrap();
+            return Err(format!("Failed to launch TERA.exe: {}", e).into());
+        }
+    };
 
     let pid = child.id();
     info!("Game process spawned with PID: {}", pid);

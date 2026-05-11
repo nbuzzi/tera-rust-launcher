@@ -11,6 +11,7 @@ const App = {
   currentLanguage: "EUR",
   languages: {
     EUR: "ENGLISH",
+    ESP: "SPANISH",
     FRA: "FRENCH",
     RUS: "RUSSIAN",
     GER: "GERMAN",
@@ -1356,11 +1357,38 @@ const App = {
    */
   async changeLanguage(newLang) {
     if (newLang !== this.currentLanguage) {
+      const previousLang = this.currentLanguage;
       this.currentLanguage = newLang;
-      await invoke("save_language_to_config", {
-        language: this.currentLanguage,
-      });
-      console.log(`Language saved to config: ${this.currentLanguage}`);
+
+      // Special handling for SPANISH (ESP): it's a launcher-only virtual
+      // language that swaps DataCenter_Final_EUR.dat with the bundled Spanish
+      // translation. The game itself is launched with -LANGUAGEEXT=ENG (EUR).
+      try {
+        if (newLang === "ESP") {
+          // Swap DataCenter to Spanish; game lang in config stays "EUR".
+          await invoke("lang_switch_to_spanish");
+          await invoke("save_language_to_config", { language: "EUR" });
+          console.log("DataCenter swapped to Spanish (config lang = EUR)");
+        } else {
+          // If we were on Spanish, restore the original EUR DataCenter first.
+          if (previousLang === "ESP") {
+            try {
+              await invoke("lang_switch_to_english");
+              console.log("DataCenter restored to English backup");
+            } catch (e) {
+              console.warn("Failed to restore English DataCenter:", e);
+            }
+          }
+          await invoke("save_language_to_config", {
+            language: this.currentLanguage,
+          });
+          console.log(`Language saved to config: ${this.currentLanguage}`);
+        }
+      } catch (err) {
+        console.error("Error changing language:", err);
+        this.currentLanguage = previousLang;
+        throw err;
+      }
 
       await this.loadTranslations();
       await this.updateAllUIElements();
@@ -1473,11 +1501,17 @@ const App = {
         console.log("Log modal element not found");
       }
 
+      // Pre-launch hygiene: kill any zombie TERA.exe from a previous failed launch.
+      // This is the #1 cause of "silent crash on launch" reports.
+      try {
+        const killResult = await invoke("kill_stale_tera_processes");
+        console.log("[pre-launch] zombie cleanup:", killResult);
+      } catch (e) { console.warn("[pre-launch] zombie cleanup skipped:", e); }
+
       const result = await invoke("handle_launch_game");
       console.log("Game launch result:", result);
-
       // Auto-boost: after the game has spawned, set HIGH priority + CPU affinity.
-      // Tries up to ~10s in case the process is slow to appear.
+      // Tries up to ~15s in case the process is slow to appear.
       (async () => {
         for (let i = 0; i < 10; i++) {
           await new Promise(r => setTimeout(r, 1500));
@@ -2047,6 +2081,18 @@ const App = {
     try {
       this.currentLanguage = await invoke("get_language_from_config");
       console.log(`Language loaded from config: ${this.currentLanguage}`);
+
+      // If Spanish DataCenter is currently active, show SPANISH as selected
+      // regardless of the underlying config value (which stays as "EUR").
+      try {
+        const langStatus = await invoke("lang_get_status");
+        if (langStatus && langStatus.current === "spanish") {
+          this.currentLanguage = "ESP";
+          console.log("Detected active Spanish DataCenter -> selector = ESP");
+        }
+      } catch (e) {
+        console.warn("lang_get_status unavailable:", e);
+      }
 
       const selectWrapper = document.querySelector(".select-wrapper");
       const selectStyled = selectWrapper?.querySelector(".select-styled");
