@@ -40,6 +40,9 @@
         "icons/tera_server.png",
         "icons/tera_server.ico"
       ],
+      "resources": [
+        "resources/dxvk/*"
+      ],
       "copyright": "Tera Launcher",
       "shortDescription": "A Tauri Launcher for Tera Pserver"
     }

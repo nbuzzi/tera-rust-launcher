@@ -31,6 +31,7 @@ use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use walkdir::WalkDir;
 
+mod optimizer;
 
 // Struct definitions
 #[derive(Serialize, Deserialize)]
@@ -1074,6 +1075,209 @@ async fn check_server_connection() -> Result<bool, String> {
 }
 
 
+// =====================================================================
+// FPS Optimizer commands
+// =====================================================================
+
+#[tauri::command]
+fn opt_get_status() -> Result<optimizer::OptimizationStatus, String> {
+    let (game_path, _) = load_config()?;
+    Ok(optimizer::get_status(&game_path))
+}
+
+fn resolve_dxvk_resources(app: &tauri::AppHandle) -> Result<(PathBuf, PathBuf), String> {
+    // Try multiple candidate locations so it works in both packaged (.msi/installer)
+    // and unpackaged (`cargo build --release`) modes.
+    let candidates_for = |rel: &str| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = Vec::new();
+        // 1) Tauri resource resolver (works in bundled installer)
+        if let Some(p) = app.path_resolver().resolve_resource(rel) {
+            v.push(p);
+        }
+        // 2) Next to the exe (e.g. release build with resources copied beside it)
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                v.push(dir.join(rel));
+                v.push(dir.join(PathBuf::from(rel).file_name().unwrap_or_default()));
+            }
+        }
+        // 3) Dev path: src-tauri/resources/... when running from target/release
+        if let Ok(exe) = std::env::current_exe() {
+            // target/release/teralaunch.exe -> ../../resources/...
+            if let Some(target_dir) = exe.parent().and_then(|p| p.parent()) {
+                if let Some(src_tauri) = target_dir.parent() {
+                    v.push(src_tauri.join(rel));
+                }
+            }
+        }
+        // 4) CWD fallback
+        v.push(PathBuf::from(rel));
+        v
+    };
+    let pick = |rel: &str| -> Result<PathBuf, String> {
+        let tried = candidates_for(rel);
+        for c in &tried {
+            if c.exists() { return Ok(c.clone()); }
+        }
+        Err(format!(
+            "Bundled resource '{}' not found. Tried: {}",
+            rel,
+            tried.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" | ")
+        ))
+    };
+    let dll  = pick("resources/dxvk/d3d9.dll")?;
+    let conf = pick("resources/dxvk/dxvk.conf")?;
+    Ok((dll, conf))
+}
+
+#[tauri::command]
+fn opt_apply_profile(
+    app: tauri::AppHandle,
+    profile: String,
+) -> Result<optimizer::OptimizationReport, String> {
+    let (game_path, _) = load_config()?;
+    let prof = match profile.to_lowercase().as_str() {
+        "safe" => optimizer::Profile::Safe,
+        "balanced" => optimizer::Profile::Balanced,
+        "maximum" | "max" => optimizer::Profile::Maximum,
+        "ultra" => optimizer::Profile::Ultra,
+        other => return Err(format!("Unknown profile: {}", other)),
+    };
+    let (dll, conf) = resolve_dxvk_resources(&app).ok().unzip();
+    Ok(optimizer::apply_profile(prof, &game_path, dll.as_deref(), conf.as_deref()))
+}
+
+#[tauri::command]
+fn opt_revert_all() -> Result<optimizer::OptimizationReport, String> {
+    let (game_path, _) = load_config()?;
+    Ok(optimizer::revert_all(&game_path))
+}
+
+#[tauri::command]
+fn opt_patch_ini() -> Result<optimizer::StepResult, String> {
+    let (game_path, _) = load_config()?;
+    optimizer::patch_ini_files(&game_path)
+}
+
+#[tauri::command]
+fn opt_patch_laa() -> Result<optimizer::StepResult, String> {
+    let (game_path, _) = load_config()?;
+    let exe = game_path.join("Binaries").join("TERA.exe");
+    optimizer::patch_exe_laa(&exe)
+}
+
+#[tauri::command]
+fn opt_install_dxvk(app: tauri::AppHandle) -> Result<optimizer::StepResult, String> {
+    let (game_path, _) = load_config()?;
+    let (dll, conf) = resolve_dxvk_resources(&app)?;
+    optimizer::install_dxvk(&game_path, &dll, &conf)
+}
+
+#[tauri::command]
+fn opt_uninstall_dxvk() -> Result<optimizer::StepResult, String> {
+    let (game_path, _) = load_config()?;
+    optimizer::uninstall_dxvk(&game_path)
+}
+
+#[tauri::command]
+fn opt_enable_lfh() -> Result<optimizer::StepResult, String> {
+    optimizer::enable_lfh()
+}
+
+#[tauri::command]
+fn opt_patch_ini_aggressive() -> Result<optimizer::StepResult, String> {
+    let (game_path, _) = load_config()?;
+    optimizer::patch_ini_aggressive(&game_path)
+}
+
+#[tauri::command]
+fn opt_disable_game_bar() -> Result<optimizer::StepResult, String> {
+    optimizer::disable_game_bar()
+}
+
+#[tauri::command]
+fn opt_enable_game_bar() -> Result<optimizer::StepResult, String> {
+    optimizer::enable_game_bar()
+}
+
+#[tauri::command]
+fn opt_apply_nvidia_tweaks() -> Result<optimizer::StepResult, String> {
+    optimizer::apply_nvidia_tweaks()
+}
+
+/// Boost the already-running TERA.exe to High priority + affinity (cores 1..N).
+/// Frontend should call this a few seconds after handle_launch_game.
+/// `mode` = "default" (all cores except 0) or "physical" (skip SMT siblings, even-indexed cores).
+#[tauri::command]
+async fn opt_boost_running_game(mode: Option<String>) -> Result<String, String> {
+    let mode = mode.unwrap_or_else(|| "default".to_string());
+    let affinity_expr = if mode == "physical" {
+        // Use only physical cores: 0, 2, 4, ... but reserve core 0 for OS -> 2,4,6,...
+        r#"
+            $cores = [Environment]::ProcessorCount
+            $mask = 0
+            for ($i = 2; $i -lt $cores; $i += 2) { $mask = $mask -bor (1 -shl $i) }
+        "#
+    } else {
+        r#"
+            $cores = [Environment]::ProcessorCount
+            $mask = 0
+            for ($i = 1; $i -lt $cores; $i++) { $mask = $mask -bor (1 -shl $i) }
+        "#
+    };
+    let script = format!(r#"
+        $p = Get-Process -Name TERA -ErrorAction SilentlyContinue
+        if (-not $p) {{ Write-Output "NOT_RUNNING"; exit }}
+        foreach ($proc in $p) {{
+            try {{
+                $proc.PriorityClass = 'High'
+                {affinity_expr}
+                if ($mask -gt 0) {{ $proc.ProcessorAffinity = [IntPtr]$mask }}
+            }} catch {{ Write-Output "ERR: $_" }}
+        }}
+        Write-Output "OK"
+    "#);
+    let output = std::process::Command::new("powershell")
+        .args(&["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[tauri::command]
+#[cfg(windows)]
+fn opt_is_elevated() -> bool {
+    // Try writing to a HKLM probe; reg query is enough to detect admin reliably
+    let output = std::process::Command::new("net")
+        .args(&["session"])
+        .output();
+    match output {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn opt_is_elevated() -> bool { false }
+
+/// Relaunch the launcher as administrator (UAC prompt).
+#[tauri::command]
+fn opt_relaunch_as_admin() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_str = exe.to_string_lossy().to_string();
+    let ps = format!(
+        "Start-Process -FilePath '{}' -Verb RunAs",
+        exe_str.replace('\'', "''")
+    );
+    std::process::Command::new("powershell")
+        .args(&["-NoProfile", "-Command", &ps])
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    std::process::exit(0);
+}
+
+
 fn main() {
 
 
@@ -1151,6 +1355,21 @@ fn main() {
                 check_server_connection,
                 check_update_required,
                 download_all_files,
+                opt_get_status,
+                opt_apply_profile,
+                opt_revert_all,
+                opt_patch_ini,
+                opt_patch_laa,
+                opt_install_dxvk,
+                opt_uninstall_dxvk,
+                opt_enable_lfh,
+                opt_patch_ini_aggressive,
+                opt_disable_game_bar,
+                opt_enable_game_bar,
+                opt_apply_nvidia_tweaks,
+                opt_boost_running_game,
+                opt_is_elevated,
+                opt_relaunch_as_admin,
             ]
         )
         .run(tauri::generate_context!())

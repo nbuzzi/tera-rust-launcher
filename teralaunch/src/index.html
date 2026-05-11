@@ -54,6 +54,10 @@
         <div id="game-status" data-translate="GAME_STATUS_NOT_RUNNING" style="font-weight:700;"></div>
         <button id="generate-hash-file" class="btn btn-secondary" data-translate="GENERATE_HASH_FILE"
           style="display: none;">Generate Hash File</button>
+        <button id="perf-fps-btn" class="btn btn-secondary" title="Performance / FPS Optimizer"
+          style="margin-left:8px; background:linear-gradient(135deg,#5a2030,#802040); color:#fff; border:none; padding:6px 12px; border-radius:4px; cursor:pointer; font-weight:700;">
+          ⚡ FPS
+        </button>
       </div>
       <div class="app-btn">
         <div class="app-btn-content">
@@ -100,6 +104,236 @@
         <p id="hash-file-progress-text"></p>
     </div>
 </div>
+
+<div id="perfModal" class="modal" style="display:none;">
+  <div class="modal-content perf-modal-content">
+    <span class="close" id="perfClose">&times;</span>
+    <h2>Performance / FPS Optimizer</h2>
+    <p style="margin: 6px 0 14px 0; font-size: 13px; opacity: .85;">
+      Choose a profile. All changes are reversible (originals backed up).
+    </p>
+
+    <div id="perfStatus" class="perf-status">
+      <div><b>INI patched:</b> <span id="st-ini">?</span></div>
+      <div><b>INI aggressive:</b> <span id="st-ini-agg">?</span></div>
+      <div><b>LAA patched:</b> <span id="st-laa">?</span></div>
+      <div><b>DXVK installed:</b> <span id="st-dxvk">?</span></div>
+      <div><b>LFH enabled:</b> <span id="st-lfh">?</span></div>
+      <div><b>Game Bar off:</b> <span id="st-gbar">?</span></div>
+      <div><b>NVIDIA tweaks:</b> <span id="st-nv">?</span></div>
+      <div><b>Admin:</b> <span id="st-admin">?</span></div>
+    </div>
+
+    <div class="perf-buttons">
+      <button class="perf-btn" data-profile="safe">
+        <b>SAFE</b><br><span>Only INI tweaks</span>
+      </button>
+      <button class="perf-btn" data-profile="balanced">
+        <b>BALANCED</b><br><span>INI + LAA + LFH<br><i>admin</i></span>
+      </button>
+      <button class="perf-btn perf-btn-max" data-profile="maximum">
+        <b>MAXIMUM</b><br><span>+ DXVK (DX9→Vulkan)<br><i>admin</i></span>
+      </button>
+      <button class="perf-btn perf-btn-ultra" data-profile="ultra">
+        <b>ULTRA FPS</b><br><span>+ Aggressive INI<br>+ Game Bar off<br>+ NVIDIA<br><i>admin</i></span>
+      </button>
+    </div>
+
+    <details class="perf-details">
+      <summary>Individual toggles (advanced)</summary>
+      <div class="perf-toggle-row">
+        <button class="perf-btn-sec" data-cmd="opt_patch_ini">Apply base INI</button>
+        <button class="perf-btn-sec" data-cmd="opt_patch_ini_aggressive">Apply aggressive INI</button>
+        <button class="perf-btn-sec" data-cmd="opt_patch_laa">Patch LAA (.exe)</button>
+        <button class="perf-btn-sec" data-cmd="opt_enable_lfh">Enable LFH</button>
+        <button class="perf-btn-sec" data-cmd="opt_install_dxvk">Install DXVK</button>
+        <button class="perf-btn-sec" data-cmd="opt_disable_game_bar">Disable Game Bar</button>
+        <button class="perf-btn-sec" data-cmd="opt_apply_nvidia_tweaks">NVIDIA tweaks</button>
+      </div>
+    </details>
+
+    <div class="perf-actions">
+      <button class="perf-btn-sec" id="btn-refresh-status">Refresh status</button>
+      <button class="perf-btn-sec" id="btn-elevate">Relaunch as Admin</button>
+      <button class="perf-btn-danger" id="btn-revert">Revert all</button>
+    </div>
+
+    <div id="perfLog" class="perf-log"></div>
+  </div>
+</div>
+
+<style>
+  #perfModal { position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 9999; }
+  #perfModal .modal-content {
+    position: relative; margin: 5vh auto; background: #1a1a1a; color: #eee;
+    padding: 20px 24px; border-radius: 8px; max-width: 580px;
+    box-shadow: 0 8px 40px rgba(0,0,0,.6); font-family: sans-serif;
+  }
+  #perfModal h2 { margin: 0 0 6px 0; color: #fff; }
+  #perfModal .close {
+    position: absolute; right: 14px; top: 8px; font-size: 28px;
+    cursor: pointer; color: #aaa;
+  }
+  #perfModal .close:hover { color: #fff; }
+  .perf-status {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px;
+    background: rgba(0,0,0,.35); padding: 10px 14px; border-radius: 6px;
+    font-size: 13px; margin-bottom: 14px;
+  }
+  .perf-status .ok  { color: #6f6; }
+  .perf-status .bad { color: #f88; }
+  .perf-buttons { display: flex; gap: 8px; margin-bottom: 12px; }
+  .perf-btn, .perf-btn-max {
+    flex: 1; padding: 12px 8px; border: 1px solid #555;
+    background: #2a2a2a; color: #eee; cursor: pointer; border-radius: 5px;
+    font-size: 12px; line-height: 1.3; text-align: center;
+  }
+  .perf-btn:hover { background: #3a3a3a; border-color: #888; }
+  .perf-btn-max  { background: linear-gradient(135deg, #5a2030, #802040); }
+  .perf-btn-max:hover { filter: brightness(1.2); }
+  .perf-btn-ultra { background: linear-gradient(135deg, #1a4d3a, #2a8f60); }
+  .perf-btn-ultra:hover { filter: brightness(1.2); }
+  .perf-btn span { font-size: 11px; opacity: .8; }
+  .perf-details { margin: 0 0 10px 0; background: rgba(0,0,0,.25); padding: 6px 10px; border-radius: 4px; }
+  .perf-details summary { cursor: pointer; font-size: 12px; color: #aaa; user-select: none; }
+  .perf-details summary:hover { color: #fff; }
+  .perf-toggle-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .perf-toggle-row .perf-btn-sec { flex: 1 1 auto; min-width: 120px; padding: 6px 8px; font-size: 11px; }
+  .perf-actions  { display: flex; gap: 8px; margin-bottom: 10px; }
+  .perf-btn-sec, .perf-btn-danger {
+    flex: 1; padding: 8px; border: 1px solid #555; background: #1e1e1e;
+    color: #ddd; cursor: pointer; border-radius: 4px; font-size: 12px;
+  }
+  .perf-btn-sec:hover    { background: #2a2a2a; }
+  .perf-btn-danger       { border-color: #844; color: #fbb; }
+  .perf-btn-danger:hover { background: #401818; }
+  .perf-log {
+    background: #111; color: #ddd; padding: 8px 10px; border-radius: 4px;
+    font-family: Consolas, monospace; font-size: 11px;
+    max-height: 160px; overflow-y: auto; white-space: pre-wrap;
+    border: 1px solid #333;
+  }
+  .perf-log .step-ok  { color: #6f6; }
+  .perf-log .step-err { color: #f88; }
+</style>
+
+<script>
+  (function () {
+    const getInvoke = () => (window.__TAURI__ && window.__TAURI__.tauri && window.__TAURI__.tauri.invoke)
+                         || (window.__TAURI__ && window.__TAURI__.invoke);
+
+    const modal    = document.getElementById('perfModal');
+    const openBtn  = document.getElementById('perf-fps-btn');
+    const closeBtn = document.getElementById('perfClose');
+    const logBox   = document.getElementById('perfLog');
+
+    function setBool(id, v) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = v ? 'YES' : 'NO';
+      el.className   = v ? 'ok' : 'bad';
+    }
+    function logLine(msg, cls) {
+      const span = document.createElement('div');
+      if (cls) span.className = cls;
+      span.textContent = msg;
+      logBox.appendChild(span);
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    async function refreshStatus() {
+      const invoke = getInvoke();
+      if (!invoke) { logLine('Tauri API not ready', 'step-err'); return; }
+      try {
+        const st = await invoke('opt_get_status');
+        setBool('st-ini',     st.ini_patched);
+        setBool('st-ini-agg', st.ini_aggressive);
+        setBool('st-laa',     st.laa_patched);
+        setBool('st-dxvk',    st.dxvk_installed);
+        setBool('st-lfh',     st.lfh_enabled);
+        setBool('st-gbar',    st.game_bar_disabled);
+        setBool('st-nv',      st.nvidia_tweaks_applied);
+      } catch (e) { logLine('status error: ' + e, 'step-err'); }
+      try {
+        const adm = await invoke('opt_is_elevated');
+        setBool('st-admin', adm);
+      } catch (e) {}
+    }
+
+    async function applyProfile(profile) {
+      const invoke = getInvoke();
+      if (!invoke) return;
+      logLine('>>> Applying profile: ' + profile.toUpperCase());
+      try {
+        const rep = await invoke('opt_apply_profile', { profile });
+        for (const s of rep.steps) {
+          logLine('  ' + (s.ok ? 'OK  ' : 'ERR ') + s.name + ': ' + s.detail,
+                  s.ok ? 'step-ok' : 'step-err');
+        }
+        logLine(rep.success ? '<<< DONE' : '<<< COMPLETED WITH ERRORS',
+                rep.success ? 'step-ok' : 'step-err');
+      } catch (e) { logLine('apply error: ' + e, 'step-err'); }
+      await refreshStatus();
+    }
+
+    async function revertAll() {
+      if (!confirm('Revert ALL optimizations? Backups will be restored.')) return;
+      const invoke = getInvoke();
+      logLine('>>> Reverting all...');
+      try {
+        const rep = await invoke('opt_revert_all');
+        for (const s of rep.steps) {
+          logLine('  ' + (s.ok ? 'OK  ' : 'ERR ') + s.name + ': ' + s.detail,
+                  s.ok ? 'step-ok' : 'step-err');
+        }
+      } catch (e) { logLine('revert error: ' + e, 'step-err'); }
+      await refreshStatus();
+    }
+
+    if (openBtn) {
+      openBtn.addEventListener('click', () => {
+        modal.style.display = 'block';
+        refreshStatus();
+      });
+    }
+    if (closeBtn) closeBtn.addEventListener('click', () => modal.style.display = 'none');
+    window.addEventListener('click', (e) => { if (e.target === modal) modal.style.display = 'none'; });
+
+    document.querySelectorAll('.perf-btn').forEach(b => {
+      b.addEventListener('click', () => applyProfile(b.dataset.profile));
+    });
+    // Individual toggles
+    document.querySelectorAll('.perf-toggle-row .perf-btn-sec[data-cmd]').forEach(b => {
+      b.addEventListener('click', async () => {
+        const invoke = getInvoke();
+        if (!invoke) return;
+        const cmd = b.dataset.cmd;
+        logLine('>>> ' + cmd);
+        try {
+          const s = await invoke(cmd);
+          if (s && typeof s === 'object' && 'ok' in s) {
+            logLine('  ' + (s.ok ? 'OK  ' : 'ERR ') + s.name + ': ' + s.detail,
+                    s.ok ? 'step-ok' : 'step-err');
+          } else {
+            logLine('  OK  ' + JSON.stringify(s), 'step-ok');
+          }
+        } catch (e) { logLine('  ERR ' + e, 'step-err'); }
+        await refreshStatus();
+      });
+    });
+    const refBtn = document.getElementById('btn-refresh-status');
+    if (refBtn) refBtn.addEventListener('click', refreshStatus);
+    const rvBtn = document.getElementById('btn-revert');
+    if (rvBtn) rvBtn.addEventListener('click', revertAll);
+    const elBtn = document.getElementById('btn-elevate');
+    if (elBtn) elBtn.addEventListener('click', async () => {
+      const invoke = getInvoke();
+      if (!invoke) return;
+      if (!confirm('The launcher will relaunch with admin rights (UAC prompt). Continue?')) return;
+      try { await invoke('opt_relaunch_as_admin'); } catch (e) { logLine('elevate error: ' + e, 'step-err'); }
+    });
+  })();
+</script>
 </body>
 </body>
 

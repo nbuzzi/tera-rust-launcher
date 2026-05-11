@@ -1475,6 +1475,21 @@ const App = {
 
       const result = await invoke("handle_launch_game");
       console.log("Game launch result:", result);
+
+      // Auto-boost: after the game has spawned, set HIGH priority + CPU affinity.
+      // Tries up to ~10s in case the process is slow to appear.
+      (async () => {
+        for (let i = 0; i < 10; i++) {
+          await new Promise(r => setTimeout(r, 1500));
+          try {
+            const r = await invoke("opt_boost_running_game");
+            if (r && r.startsWith("OK")) {
+              console.log("[optimizer] TERA.exe boosted (HIGH priority + affinity)");
+              break;
+            }
+          } catch (e) { console.warn("[optimizer] boost attempt failed:", e); }
+        }
+      })();
     } catch (error) {
       console.error("Error initiating game launch:", error);
       const game_launch_error = this.t("GAME_LAUNCH_ERROR") + error.toString();
