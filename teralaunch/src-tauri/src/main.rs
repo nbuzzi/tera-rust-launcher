@@ -34,6 +34,7 @@ use walkdir::WalkDir;
 mod optimizer;
 mod language;
 mod self_update;
+mod file_log;
 
 // Struct definitions
 #[derive(Serialize, Deserialize)]
@@ -1420,9 +1421,27 @@ fn main() {
 
     let (tera_logger, mut tera_log_receiver) = teralib::setup_logging();
 
-    // Configure only the teralib logger
-    log::set_boxed_logger(Box::new(tera_logger)).expect("Failed to set logger");
+    // Wrap the teralib channel logger in a file-mirroring logger so every
+    // `log::info!` call in this process (teralib + teralaunch + tauri/wry/
+    // reqwest warnings) ends up in `%APPDATA%\teralaunch\launcher.log`. This
+    // is the only way to diagnose handshake failures after the user has
+    // already closed the launcher window — the Tauri devtools log stream is
+    // gone by then.
+    let combined_logger = file_log::FileAndChannelLogger::new(Box::new(tera_logger));
+    let log_path = combined_logger.path();
+    log::set_boxed_logger(Box::new(combined_logger)).expect("Failed to set logger");
     log::set_max_level(LevelFilter::Info);
+
+    info!(
+        "teralaunch starting; persistent log: {}",
+        log_path.display()
+    );
+    info!(
+        "build arch: {} | host os: {} | exe: {:?}",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        std::env::current_exe().ok()
+    );
 
     // Create an asynchronous channel for logs
     let (log_sender, mut log_receiver) = mpsc::channel::<String>(100);

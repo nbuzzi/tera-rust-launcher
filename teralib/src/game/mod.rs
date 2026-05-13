@@ -7,7 +7,9 @@ use lazy_static::lazy_static;
 use log::{error, info, Level, Metadata, Record};
 use once_cell::sync::Lazy;
 use prost::Message;
+use quick_xml::de::from_str as xml_from_str;
 use reqwest;
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
     ffi::OsStr,
@@ -16,24 +18,21 @@ use std::{
     ptr::null_mut,
     slice,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc, {Arc, Mutex},
     },
     time::Duration,
 };
-use tokio::{
-    runtime::Runtime,
-    sync::{mpsc as other_mpsc, watch, Notify},
-};
+use tokio::sync::{mpsc as other_mpsc, watch, Notify};
 use winapi::{
     shared::{
-        minwindef::{BOOL, LPARAM, LRESULT, TRUE, UINT, WPARAM},
+        minwindef::{BOOL, DWORD, LPARAM, LRESULT, TRUE, UINT, WPARAM},
         windef::HWND,
     },
     um::{
         errhandlingapi::GetLastError,
         libloaderapi::GetModuleHandleW,
-        winuser::{GetClassInfoExW, *},
+        winuser::{GetClassInfoExW, GetWindowThreadProcessId, *},
     },
 };
 
@@ -56,7 +55,20 @@ use serverlist::{server_list::ServerInfo, ServerList};
 // Global static variables
 lazy_static! {
     static ref SERVER_LIST_SENDER: Mutex<Option<mpsc::Sender<(WPARAM, usize)>>> = Mutex::new(None);
+
+    /// Cache of the protobuf-encoded server list, populated once before TERA.exe
+    /// is spawned. Why: TERA's IPC pump on a UI thread cannot tolerate the long
+    /// blocking HTTP fetch that `handle_server_list_request` used to do
+    /// (it spun up a fresh tokio Runtime inside a SendMessage handler — runtime
+    /// inside runtime panics, slow handshakes, lost server list). With the
+    /// cache we can answer event 5 synchronously with the pre-baked bytes.
+    static ref SERVER_LIST_CACHE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 }
+
+/// PID of the spawned TERA.exe process. Used by `find_game_main_window` to
+/// locate the game's IPC window (TERA creates it asynchronously, so the
+/// handshake task has to poll for it after spawn).
+static GAME_PID: Lazy<AtomicU32> = Lazy::new(|| AtomicU32::new(0));
 
 /// Handle to the game window.
 ///
@@ -253,6 +265,27 @@ async fn launch_game() -> Result<ExitStatus, Box<dyn std::error::Error>> {
 
     tcs.notified().await;
 
+    // Pre-fetch the server list BEFORE we spawn TERA.exe. The IPC handler that
+    // services event 5 runs on the Win32 message-pump thread; doing the HTTP
+    // fetch from there used to spawn a fresh tokio Runtime inside a
+    // SendMessage callback, which panics ("Cannot start a runtime from within
+    // a runtime") and silently leaves the launcher unable to answer the
+    // server list request — TERA then sits forever on a blank dropdown.
+    info!("Pre-fetching server list before game launch...");
+    match prefetch_server_list().await {
+        Ok(bytes) => {
+            info!("Server list pre-fetched: {} bytes", bytes.len());
+            *SERVER_LIST_CACHE.lock().unwrap() = Some(bytes);
+        }
+        Err(e) => {
+            error!(
+                "Server list pre-fetch failed: {}. Will fall back to live fetch on demand.",
+                e
+            );
+            *SERVER_LIST_CACHE.lock().unwrap() = None;
+        }
+    }
+
     // --- Robust spawn ---
     // 1. Set CWD to the Binaries folder so TERA finds its DLLs (PhysX, GFx, dxvk, etc.)
     //    This is CRITICAL: without it, users who launch from a shortcut without a
@@ -307,6 +340,7 @@ async fn launch_game() -> Result<ExitStatus, Box<dyn std::error::Error>> {
 
     let pid = child.id();
     info!("Game process spawned with PID: {}", pid);
+    GAME_PID.store(pid, Ordering::SeqCst);
 
     let status = child.wait()?;
     info!("Game process exited with status: {:?}", status);
@@ -413,20 +447,41 @@ unsafe extern "system" fn wnd_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    info!("Received message: {}", msg);
     match msg {
         WM_COPYDATA => {
             let copy_data = &*(l_param as *const COPYDATASTRUCT);
-            info!("Received WM_COPYDATA message");
             let event_id = copy_data.dwData;
-            info!("Event ID: {}", event_id);
+
+            // The sender's HWND comes through as wParam per the WM_COPYDATA
+            // contract. Looking it up to a PID lets us correlate launcher
+            // logs with the spawned TERA.exe and detect spoofed/UIPI-blocked
+            // messages from other processes.
+            let sender_hwnd = w_param as HWND;
+            let mut sender_pid: DWORD = 0;
+            if !sender_hwnd.is_null() {
+                GetWindowThreadProcessId(sender_hwnd, &mut sender_pid);
+            }
+
             let payload = if copy_data.cbData > 0 {
                 slice::from_raw_parts(copy_data.lpData as *const u8, copy_data.cbData as usize)
             } else {
                 &[]
             };
-            let hex_payload: Vec<String> = payload.iter().map(|b| format!("{:02X}", b)).collect();
-            info!("Payload (hex): {}", hex_payload.join(" "));
+
+            info!(
+                "WM_COPYDATA received: sender_hwnd={:?} sender_pid={} dwData={} cbData={}",
+                sender_hwnd, sender_pid, event_id, copy_data.cbData
+            );
+            // Only hex-dump small payloads. Event 1000's 520-byte struct dump
+            // floods the log every launch and obscures the actual handshake
+            // signal.
+            if payload.len() <= 64 {
+                let hex_payload: Vec<String> =
+                    payload.iter().map(|b| format!("{:02X}", b)).collect();
+                info!("  payload (hex): {}", hex_payload.join(" "));
+            } else {
+                info!("  payload: {} bytes (truncated)", payload.len());
+            }
 
             match event_id {
                 1 => handle_account_name_request(w_param, h_wnd),
@@ -721,10 +776,49 @@ unsafe fn handle_session_ticket_request(recipient: WPARAM, sender: HWND) {
 /// * `recipient` - The HWND of the recipient window as a WPARAM.
 /// * `sender` - The sender's window handle as a usize.
 unsafe fn handle_server_list_request(recipient: WPARAM, sender: usize) {
-    let runtime = Runtime::new().expect("Failed to create Tokio runtime");
-    let server_list_data =
-        runtime.block_on(async { get_server_list().await.expect("Failed to get server list") });
-    send_response_message(recipient, sender as HWND, 6, &server_list_data);
+    // Fast path: serve the bytes pre-fetched in launch_game(). This is the
+    // common case once the user clicks PLAY.
+    if let Some(bytes) = SERVER_LIST_CACHE.lock().unwrap().clone() {
+        info!(
+            "handle_server_list_request: serving from pre-fetch cache ({} bytes)",
+            bytes.len()
+        );
+        send_response_message(recipient, sender as HWND, 6, &bytes);
+        return;
+    }
+
+    // Fallback: pre-fetch failed earlier (network was down) but the user is
+    // here anyway, so try once more synchronously. We MUST NOT spin up a new
+    // tokio Runtime here — wnd_proc runs on the Win32 message-pump thread,
+    // and `Runtime::new()` inside a SendMessage handler panics ("Cannot start
+    // a runtime from within a runtime"). Use a dedicated current-thread
+    // runtime on a worker thread instead.
+    info!("handle_server_list_request: cache empty, attempting on-demand fetch...");
+    let result = std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        rt.block_on(async { prefetch_server_list().await.ok() })
+    })
+    .join();
+
+    match result {
+        Ok(Some(bytes)) => {
+            info!(
+                "handle_server_list_request: on-demand fetch ok ({} bytes)",
+                bytes.len()
+            );
+            *SERVER_LIST_CACHE.lock().unwrap() = Some(bytes.clone());
+            send_response_message(recipient, sender as HWND, 6, &bytes);
+        }
+        _ => {
+            error!(
+                "handle_server_list_request: failed to obtain server list, sending empty payload"
+            );
+            send_response_message(recipient, sender as HWND, 6, &[]);
+        }
+    }
 }
 
 /// Handles the event of entering a lobby or world.
@@ -752,21 +846,13 @@ unsafe fn handle_enter_lobby_or_world(recipient: WPARAM, sender: HWND, payload: 
     }
 }
 
-/// Handles the game start event.
+/// Handles TERA's game-start notification (event 0x3e8 / 1000).
 ///
-/// This function is called when the game starts. Currently, it only logs the event.
-///
-/// # Safety
-///
-/// This function is unsafe due to its use of raw pointers, but it doesn't perform any unsafe operations.
-///
-/// # Arguments
-///
-/// * `_recipient` - The HWND of the recipient window as a WPARAM (unused).
-/// * `_sender` - The HWND of the sender window (unused).
-/// * `_payload` - The payload associated with the game start event (unused).
-unsafe fn handle_game_start(_recipient: WPARAM, _sender: HWND, _payload: &[u8]) {
-    info!("Game started");
+/// The classic launcher does not answer this notification. TERA asks for the
+/// account name, ticket, and server list with separate events 0x1, 0x3, and
+/// 0x5, which are handled independently.
+unsafe fn handle_game_start(_recipient: WPARAM, _sender: HWND, payload: &[u8]) {
+    info!("Game start notification (event 1000), payload {} bytes", payload.len());
 }
 
 /// Handles various game events.
@@ -836,33 +922,41 @@ fn on_world_entered(world_name: &str) {
     info!("Entered the world: {}", world_name);
 }
 
-/// Asynchronously retrieves the server list.
-///
-/// This function sends a GET request to a local server to retrieve the server list,
-/// then parses the JSON response into a ServerList struct.
-///
-/// # Returns
-///
-/// A Result containing a Vec<u8> of the encoded server list on success, or an error on failure.
-async fn get_server_list() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let url = config::get_config_value("SERVER_LIST_URL");
-    let client = reqwest::Client::new();
-    let response = client
-        .get(url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await?;
+// `get_server_list` was the original JSON-only fetcher; it has been
+// superseded by `prefetch_server_list`, which auto-detects XML vs JSON and
+// supports both the retail XML wire format and the tera-api JSON flavor.
 
-    if !response.status().is_success() {
-        return Err(format!("Unsuccessful HTTP response: {}", response.status()).into());
-    }
+#[derive(Debug, Deserialize)]
+struct XmlServerList {
+    #[serde(rename = "server", default)]
+    servers: Vec<XmlServer>,
+}
 
-    let json: Value = response.json().await?;
-    let server_list = parse_server_list_json(&json)?;
+#[derive(Debug, Deserialize)]
+struct XmlServer {
+    id: u32,
+    ip: String,
+    port: u32,
+    category: XmlText,
+    name: XmlName,
+    crowdness: XmlText,
+    open: XmlText,
+    #[serde(default)]
+    popup: String,
+}
 
-    let mut buf = Vec::new();
-    server_list.encode(&mut buf)?;
-    Ok(buf)
+#[derive(Debug, Deserialize)]
+struct XmlText {
+    #[serde(rename = "$text", default)]
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XmlName {
+    #[serde(rename = "@raw_name", default)]
+    raw_name: String,
+    #[serde(rename = "$text", default)]
+    text: String,
 }
 
 /// Parses JSON into ServerList struct.
@@ -878,40 +972,10 @@ async fn get_server_list() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 /// Result<ServerList, Box<dyn std::error::Error>>:
 /// - Ok(ServerList): Populated ServerList struct
 /// - Err: Parsing error description
-fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error::Error>> {
-    let mut server_list = ServerList {
-        servers: vec![],
-        last_server_id: 0,
-        sort_criterion: 2,
-    };
-
-    // Parse GLOBAL_CREDENTIALS.get_characters_count()
-    let credentials = GLOBAL_CREDENTIALS.get_characters_count();
-    info!("Raw credentials string: {}", credentials);
-
-    // Format from Portal API: "lastLoginServer|serverId,charCount|serverId,charCount|"
-    // Each '|'-separated entry after the first is one "serverId,charCount" pair.
-    let parts: Vec<&str> = credentials.split('|').collect();
-
-    let player_last_server_id = parts
-        .first()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(0);
-
-    // Parse character counts for each server (one pair per '|'-separated entry)
-    let character_counts: std::collections::HashMap<u32, u32> = parts
-        .iter()
-        .skip(1)
-        .filter_map(|entry| {
-            if entry.is_empty() {
-                return None;
-            }
-            let mut it = entry.split(',');
-            let id = it.next()?.trim().parse::<u32>().ok()?;
-            let count = it.next()?.trim().parse::<u32>().ok()?;
-            Some((id, count))
-        })
-        .collect();
+fn parse_server_list_json(
+    json: &Value,
+) -> Result<ServerList, Box<dyn std::error::Error + Send + Sync>> {
+    let (player_last_server_id, character_counts) = parse_character_counts();
 
     info!(
         "Parsed values - Last server ID: {}, Character counts: {:?}",
@@ -921,6 +985,12 @@ fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error
     let servers = json["servers"]
         .as_array()
         .ok_or("No servers found in JSON")?;
+    let mut server_list = ServerList {
+        servers: Vec::with_capacity(servers.len()),
+        last_server_id: 0,
+        sort_criterion: 0,
+    };
+
     for server in servers {
         let server_id = server["id"]
             .as_u64()
@@ -935,15 +1005,12 @@ fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error
         );
 
         let display_count = format!("({})", character_count);
-        let name = format!(
-            "{}{}",
-            server["name"]
-                .as_str()
-                .ok_or("Missing or invalid 'name' field")?,
-            display_count
-        );
+        let name = server["name"]
+            .as_str()
+            .ok_or("Missing or invalid 'name' field")?
+            .to_string();
         let title = format!(
-            "{}{}",
+            "{} {}",
             server["title"]
                 .as_str()
                 .ok_or("Missing or invalid 'title' field")?,
@@ -1011,15 +1078,107 @@ fn parse_server_list_json(json: &Value) -> Result<ServerList, Box<dyn std::error
             unavailable_message: utf16_to_bytes(
                 server["unavailable_message"].as_str().unwrap_or(""),
             ),
-            host,
+            host: if host.is_empty() { None } else { Some(host) },
         };
         server_list.servers.push(server_info);
     }
 
-    server_list.last_server_id = player_last_server_id;
-    server_list.sort_criterion = json["sort_criterion"].as_u64().unwrap_or(3) as u32;
+    server_list.last_server_id = if player_last_server_id == 0 {
+        server_list.servers.first().map(|s| s.id).unwrap_or(0)
+    } else {
+        player_last_server_id
+    };
+    server_list.sort_criterion = json["sort_criterion"].as_u64().unwrap_or(0) as u32;
 
     Ok(server_list)
+}
+
+fn parse_server_list_xml(
+    xml: &str,
+) -> Result<ServerList, Box<dyn std::error::Error + Send + Sync>> {
+    let xml: XmlServerList = xml_from_str(xml)?;
+    if xml.servers.is_empty() {
+        return Err("No servers found in XML".into());
+    }
+
+    let (player_last_server_id, character_counts) = parse_character_counts();
+    let mut server_list = ServerList {
+        servers: Vec::with_capacity(xml.servers.len()),
+        last_server_id: 0,
+        sort_criterion: 0,
+    };
+
+    for server in xml.servers {
+        let character_count = character_counts.get(&server.id).cloned().unwrap_or(0);
+        let base_name = if server.name.raw_name.trim().is_empty() {
+            server.name.text.trim()
+        } else {
+            server.name.raw_name.trim()
+        };
+        let display_count = format!("({})", character_count);
+        let title = format!("{} {}", base_name, display_count);
+        let address = ipv4_to_u32(&server.ip);
+        let available = if server.open.text.trim().is_empty() || address == 0 {
+            0
+        } else {
+            1
+        };
+
+        info!(
+            "XML server id={} name='{}' ip={} port={} chars={} available={}",
+            server.id, base_name, server.ip, server.port, character_count, available
+        );
+
+        server_list.servers.push(ServerInfo {
+            id: server.id,
+            name: utf16_to_bytes(base_name),
+            category: utf16_to_bytes(server.category.text.trim()),
+            title: utf16_to_bytes(&title),
+            queue: utf16_to_bytes(server.crowdness.text.trim()),
+            population: utf16_to_bytes(server.open.text.trim()),
+            address,
+            port: server.port,
+            available,
+            unavailable_message: utf16_to_bytes(server.popup.trim()),
+            host: None,
+        });
+    }
+
+    server_list.last_server_id = if player_last_server_id == 0 {
+        server_list.servers.first().map(|s| s.id).unwrap_or(0)
+    } else {
+        player_last_server_id
+    };
+
+    Ok(server_list)
+}
+
+fn parse_character_counts() -> (u32, std::collections::HashMap<u32, u32>) {
+    let credentials = GLOBAL_CREDENTIALS.get_characters_count();
+    info!("Raw credentials string: {}", credentials);
+
+    // Format from Portal API: "lastLoginServer|serverId,charCount|serverId,charCount|"
+    let parts: Vec<&str> = credentials.split('|').collect();
+    let player_last_server_id = parts
+        .first()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+
+    let character_counts = parts
+        .iter()
+        .skip(1)
+        .filter_map(|entry| {
+            if entry.is_empty() {
+                return None;
+            }
+            let mut it = entry.split(',');
+            let id = it.next()?.trim().parse::<u32>().ok()?;
+            let count = it.next()?.trim().parse::<u32>().ok()?;
+            Some((id, count))
+        })
+        .collect();
+
+    (player_last_server_id, character_counts)
 }
 
 /// Converts a Rust string to UTF-16 little-endian bytes.
@@ -1037,6 +1196,62 @@ fn utf16_to_bytes(s: &str) -> Vec<u8> {
     s.encode_utf16()
         .flat_map(|c| c.to_le_bytes().to_vec())
         .collect()
+}
+
+/// Resolve the server-list endpoint, parse either the retail XML format or the
+/// tera-api JSON format, then return the protobuf bytes expected by TERA for
+/// WM_COPYDATA event 6.
+async fn prefetch_server_list() -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let url = config::get_config_value("SERVER_LIST_URL");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()?;
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=3u32 {
+        info!(
+            "Fetching server list (attempt {}/3) from {}",
+            attempt, url
+        );
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let body = resp.text().await?;
+                let first_non_ws = body.chars().find(|c| !c.is_whitespace()).unwrap_or('\0');
+                let server_list = if content_type.contains("json") || first_non_ws == '{' {
+                    let json: Value = serde_json::from_str(&body)?;
+                    parse_server_list_json(&json)?
+                } else {
+                    parse_server_list_xml(&body)?
+                };
+                let payload = server_list.encode_to_vec();
+                info!(
+                    "Server list parsed (content-type='{}', source {} bytes, servers={}, last_server_id={}, sort_criterion={}); event 6 protobuf {} bytes",
+                    content_type,
+                    body.len(),
+                    server_list.servers.len(),
+                    server_list.last_server_id,
+                    server_list.sort_criterion,
+                    payload.len()
+                );
+                return Ok(payload);
+            }
+            Ok(resp) => {
+                last_err = Some(format!("HTTP {}", resp.status()));
+            }
+            Err(e) => {
+                last_err = Some(format!("transport: {}", e));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    Err(last_err
+        .unwrap_or_else(|| "unknown server list fetch error".into())
+        .into())
 }
 
 /// Converts an IPv4 address string to a u32 representation.

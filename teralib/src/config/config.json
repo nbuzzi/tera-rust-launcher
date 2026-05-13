@@ -1,7 +1,7 @@
 {
-    "LOGIN_ACTION_URL": "http://tera-dimension.duckdns.org:8090/launcher/LoginAction",
-    "HASH_FILE_URL": "http://tera-dimension.duckdns.org:8090/tera/launcher/hash-file.json",
-    "FILE_SERVER_URL": "http://tera-dimension.duckdns.org:8090/public",
-    "SERVER_LIST_URL": "http://tera-dimension.duckdns.org:8090/tera/ServerList.json?lang=en&sort=3",
+    "LOGIN_ACTION_URL": "http://sd-5967132-W.dattaweb.com:8090/launcher/LoginAction",
+    "HASH_FILE_URL": "http://sd-5967132-W.dattaweb.com:8090/tera/launcher/hash-file.json",
+    "FILE_SERVER_URL": "http://sd-5967132-W.dattaweb.com:8090/public",
+    "SERVER_LIST_URL": "http://sd-5967132-W.dattaweb.com:8090/tera/ServerList?lang=en&sort=3",
     "LAUNCHER_REGISTER_TOKEN": "tera-launcher-reg-2026"
   }
