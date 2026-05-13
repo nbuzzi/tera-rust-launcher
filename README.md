@@ -31,5 +31,19 @@ For a comprehensive guide on how to set up and use this launcher, please refer t
 
 [Tera Rust Launcher Tutorial on Ragezone](https://forum.ragezone.com/threads/teralauncher-100-02-advanced-game-launcher-with-tauri-js.1231496/)
 
+## Protocol & Internals (must‑read for maintainers)
+The launcher implements the BHS launcher ↔ `TERA.exe` Win32 IPC protocol.
+If you need to touch anything related to the server list, account name,
+session ticket, game events or anti‑cheat notifications, read these docs
+first — they capture knowledge that took months to recover:
+
+- [`docs/LAUNCHER-CLIENT-PROTOCOL.md`](docs/LAUNCHER-CLIENT-PROTOCOL.md) —
+  full message catalogue, wire formats, proto2 schema, sort criteria, UIPI
+  filter requirements, and the empirically‑verified handshake order.
+- [`docs/PROTOCOL-FIX-2026-05.md`](docs/PROTOCOL-FIX-2026-05.md) —
+  postmortem of the "empty server list" bug, what was wrong, how we found
+  it (with the `fake-tera` spy in the parent server repo), and how to keep
+  the fix from regressing.
+
 ## Disclaimer
 This project is for educational purposes only. Always respect the terms of service of the game and its publishers.
